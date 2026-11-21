@@ -1,9 +1,11 @@
 """入库规则领域服务：字段映射校验、数据转换编排与导入规则管理。"""
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.source_system import SourceSystemService
 from app.store import store
 
 
@@ -121,3 +123,71 @@ class DataImportRuleService(BaseModuleService):
             else:
                 result["errors"] += 1
         return result
+
+    # ── 门店数据采集归属：落库前关联实际来源并生成入库归属凭证 ──
+
+    def find_effective_rule(self, supply_code: str, entity_model: str | None = None) -> dict[str, Any] | None:
+        """按供数编号找到该供数方已生效、可用于落库的入库规则。"""
+        rows = store.rows(self.MODULE)
+        for row in rows:
+            if row.get("来源系统") != supply_code or row.get("status") != "已生效":
+                continue
+            if entity_model and row.get("实体模型") != entity_model:
+                continue
+            return row
+        return None
+
+    def apply_supplier_mapping(self, record: dict[str, Any], supply_code: str,
+                               entity_model: str = "store_master") -> dict[str, Any] | None:
+        """用指定供数方登记的字段定义完成源字段到落库字段的转换。"""
+        rule = self.find_effective_rule(supply_code, entity_model)
+        if rule is None:
+            return None
+        return self._apply_field_mapping(record, rule)
+
+    def issue_ownership_voucher(self, *, batch_no: str, raw_row_id: str,
+                                claimed_source: str, record: dict[str, Any],
+                                entity_model: str = "store_master") -> dict[str, Any]:
+        """落库前关联实际来源并生成入库归属凭证。
+
+        凭证证明最终转换实际使用了哪个供数方的字段定义：
+        1. 通过来源系统注册（供数编号/别名）解析出实际供数方；
+        2. 取该供数方已生效的入库规则，套用其字段映射完成转换；
+        3. 固化供数编号、规则编号与字段映射快照，供改名后回查。
+        任一步骤失败都返回 ok=False，由批次服务把原始行送入受控待核区。
+        """
+        source_svc = SourceSystemService()
+        actual_source = source_svc.resolve_supply_source(claimed_source)
+        if actual_source is None:
+            return {"ok": False, "reason": "来源未注册", "claimed_source": claimed_source}
+        supply_code = str(actual_source.get("供数编号") or "").strip()
+        rule = self.find_effective_rule(supply_code, entity_model)
+        if rule is None:
+            return {"ok": False, "reason": "供数方缺少已生效入库规则", "供数编号": supply_code}
+        mapped = self._apply_field_mapping(record, rule)
+        if not mapped:
+            return {"ok": False, "reason": "字段映射后无可用落库字段", "供数编号": supply_code}
+        table = store.rows("import_ownership_voucher")
+        voucher_no = (
+            f"CERT-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}-"
+            f"{len(table) + 1:04d}"
+        )
+        voucher = {
+            "id": max((int(row.get("id", 0)) for row in table), default=0) + 1,
+            "凭证编号": voucher_no,
+            "批次编号": batch_no,
+            "原始行号": raw_row_id,
+            "声明来源": claimed_source,
+            "实际供数编号": supply_code,
+            "实际来源名称": actual_source.get("系统名称"),
+            "来源系统编号": actual_source.get("系统编号"),
+            "供数职责": actual_source.get("供数职责"),
+            "入库规则编号": rule.get("规则编号"),
+            "实体模型": rule.get("实体模型"),
+            "字段映射快照": rule.get("字段映射"),
+            "规则版本": rule.get("规则版本"),
+            "实际写入字段": mapped,
+            "生成时间": datetime.datetime.utcnow().isoformat(),
+        }
+        table.append(voucher)
+        return {"ok": True, "voucher": voucher, "mapped": mapped}

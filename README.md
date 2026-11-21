@@ -77,5 +77,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 门店数据采集归属校验
+
+代理代送批次缺少入库归属凭证，平台按原始门店记录的来源编号与登记的供数职责，
+逐行确认可用的入库映射，核心规则：
+
+- **来源注册（`source_system`）**：`register_supply_alias` 登记供数编号、有效别名与
+  供数职责（直营店/加盟店）；`resolve_supply_source` 支持按供数编号、系统编号或任一
+  别名解析实际供数方。`rename_source` 改名时把旧名称沉淀为别名，供数编号保持不变。
+- **入库归属凭证（`data_import_rule.issue_ownership_voucher`）**：落库前先关联实际
+  来源，再套用该供数方已生效入库规则的字段定义完成转换，并固化凭证（供数编号、规则
+  编号、字段映射快照、实际写入字段），证明最终转换用了哪个供数方的字段定义。
+- **代理批次校验（`import_batch.submit_agent_batch`）**：来源无法解析、或代理声明
+  职责与登记供数职责冲突的原始行进入**受控待核区**（`attribution_quarantine`），
+  不产生入库数据；通过的行写入 `store_landing_row` 并附带凭证编号。未确认的加盟店
+  不会进入直营数据。
+- **值班复核与重送**：`review_batch_attribution` 复核实际写入字段、凭证对应关系与
+  越权写入；`resubmit_corrected_rows` 接收代理更正后的重送，落地后关闭待核条目。
+- **改名回查**：`lookup_historical_batch` 凭供数编号/旧名称别名还原入库用的原编号，
+  汇总历史凭证与字段映射快照，旧批次在来源改名后仍可追溯。
+
+场景测试：`backend/app/tests/test_attribution_chain.py`（6 条用例，可直接
+`python app/tests/test_attribution_chain.py` 运行）。
+
 领域：数据工程
 子方向：数仓与数据湖

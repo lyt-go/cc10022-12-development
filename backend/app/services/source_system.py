@@ -116,3 +116,99 @@ class SourceSystemService(BaseModuleService):
             sum(int(r.get("信任权重", "0")) for r in active) / max(len(active), 1)
         )
         return base
+
+    # ── 门店数据采集归属：供数编号、有效别名与改名追溯 ──
+
+    @staticmethod
+    def _split_aliases(value: Any) -> list[str]:
+        """把逗号/顿号/分号分隔的别名串拆成去重、去空白后的列表。"""
+        if isinstance(value, (list, tuple)):
+            tokens = [str(item) for item in value]
+        else:
+            tokens = str(value or "").replace("，", ",").replace("、", ",").replace(";", ",").split(",")
+        result: list[str] = []
+        for token in tokens:
+            name = token.strip()
+            if name and name not in result:
+                result.append(name)
+        return result
+
+    def register_supply_alias(self, values: dict[str, Any]) -> dict[str, Any]:
+        """注册来源系统的供数编号及其有效别名，并登记该来源承担的供数职责。
+
+        供数编号是入库归属凭证关联实际供数方的稳定锚点；来源名称允许更改，
+        但供数编号保持不变，旧名称会沉淀为别名供历史批次回查。
+        """
+        supply_code = str(values.get("供数编号") or "").strip()
+        if not supply_code:
+            return {"ok": False, "reason": "缺少供数编号，无法登记供数职责"}
+        registered = self.register_source_system(values)
+        if not registered.get("ok"):
+            return registered
+        entry = registered["entry"]
+        aliases = self._split_aliases(values.get("有效别名"))
+        # 供数编号与当前名称本身始终是可解析的有效标识
+        for token in (supply_code, entry.get("系统名称", "")):
+            if token and token not in aliases:
+                aliases.append(token)
+        entry["供数编号"] = supply_code
+        entry["供数职责"] = str(values.get("供数职责") or "").strip()
+        entry["有效别名"] = ",".join(aliases)
+        return {"ok": True, "entry": entry, "供数编号": supply_code, "有效别名": aliases}
+
+    def resolve_supply_source(self, identifier: str) -> dict[str, Any] | None:
+        """按供数编号、系统编号或任一有效别名解析实际来源系统。
+
+        返回来源注册行（含供数编号与供数职责）；无法解析时返回 None，
+        由调用方把对应原始行送入受控待核区。
+        """
+        key = str(identifier or "").strip().casefold()
+        if not key:
+            return None
+        for row in store.rows(self.MODULE):
+            candidates = [
+                str(row.get("供数编号") or ""),
+                str(row.get("系统编号") or ""),
+                str(row.get("系统名称") or ""),
+                *self._split_aliases(row.get("有效别名")),
+            ]
+            if any(key == candidate.strip().casefold() for candidate in candidates if candidate):
+                return row
+        return None
+
+    def rename_source(self, identifier: str, new_name: str) -> dict[str, Any]:
+        """更改来源系统名称：旧名称沉淀为有效别名，供数编号保持不变。
+
+        改名后历史入库归属凭证仍可凭供数编号还原入库用的原编号，
+        旧名称也能通过别名解析回到同一来源。
+        """
+        new_name = str(new_name or "").strip()
+        if not new_name:
+            return {"ok": False, "reason": "新来源名称不能为空"}
+        entry = self.resolve_supply_source(identifier)
+        if entry is None:
+            return {"ok": False, "reason": f"来源标识「{identifier}」无法解析，改名被拒绝"}
+        old_name = str(entry.get("系统名称") or "").strip()
+        if old_name and old_name != new_name:
+            aliases = self._split_aliases(entry.get("有效别名"))
+            if old_name not in aliases:
+                aliases.append(old_name)
+            entry["有效别名"] = ",".join(aliases)
+            entry["曾用名称"] = old_name
+        entry["系统名称"] = new_name
+        return {
+            "ok": True,
+            "供数编号": entry.get("供数编号"),
+            "系统编号": entry.get("系统编号"),
+            "旧名称": old_name,
+            "新名称": new_name,
+            "有效别名": self._split_aliases(entry.get("有效别名")),
+        }
+
+    def lookup_supply_duty(self, identifier: str) -> str | None:
+        """按供数编号/别名查询登记的供数职责（如直营店、加盟店）。"""
+        entry = self.resolve_supply_source(identifier)
+        if entry is None:
+            return None
+        duty = str(entry.get("供数职责") or "").strip()
+        return duty or None
